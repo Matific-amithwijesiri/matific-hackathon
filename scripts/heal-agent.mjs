@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Playwright locator heal agent — runs tests, compares failing locators to static app HTML,
- * patches page objects (getByTestId), re-runs the target test.
+ * patches page objects (getByTestId), re-runs failed tests only on follow-up attempts (--last-failed).
  *
  * Usage:
  *   node scripts/heal-agent.mjs --grep "TC01 - valid login lands on dashboard"
@@ -54,8 +54,8 @@ function printHelp() {
   console.log(`
 Playwright heal agent
 
-  --grep <pattern>   Run tests matching Playwright grep (title regex)
-  --all              Run entire suite
+  --grep <pattern>   Run tests matching Playwright grep on the first attempt; later attempts use --last-failed
+  --all              Run entire suite on the first attempt; later attempts only re-run last run's failures
   --max-attempts N   Heal/retry cycles (default 3)
   --dry-run          Analyze and print planned patch without writing files
   --help             This message
@@ -102,6 +102,7 @@ async function main() {
     const { report, exitCode } = await runPlaywright(PROJECT_ROOT, {
       grep: args.grep,
       all: args.all,
+      lastFailed: attempt > 1,
     });
     lastExit = exitCode;
 

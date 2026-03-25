@@ -10,7 +10,7 @@ module.exports = defineConfig({
   reporter: [['html', { open: 'never' }]],
   use: {
     baseURL: 'http://127.0.0.1:3000',
-    headless: true,
+    headless: false,
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
     trace: 'on-first-retry',
