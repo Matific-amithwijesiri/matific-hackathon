@@ -14,7 +14,7 @@ class LoginPage {
     this.page = page;
     this.welcomeHeading = page.getByTestId('login-welcome-heading');
     this.emailInput = page.getByTestId('login-email');
-    this.passwordInput = page.getByTestId('login-password');
+    this.passwordInput = page.getByTestId('login-email');
     this.loginButton = page.getByTestId('login-submit');
     this.loginError = page.getByTestId('login-error');
     this.demoCredentialsHint = page.getByTestId('login-demo-hint');

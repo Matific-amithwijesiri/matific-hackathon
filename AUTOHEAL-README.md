@@ -91,14 +91,14 @@ Use **exactly one** of `--grep`, `--all`, or `--scan-all-pages`.
 
 | Variable | Purpose |
 |----------|---------|
-| `HEAL_MAX_EDIT_DISTANCE` | Maximum [Levenshtein](https://en.wikipedia.org/wiki/Levenshtein_distance) distance between the old `data-testid` and the chosen replacement in HTML (default: **15**). Increase only if you accept riskier renames. |
+| `HEAL_MAX_EDIT_DISTANCE` | Optional **warning** threshold only: if set (e.g. `15`), the agent logs a warning when the chosen DOM `data-testid` has a larger case-insensitive Levenshtein distance than this value. **Replacements are always applied** when the old id is missing from the HTML; there is no hard cap. |
 | `OPENAI_API_KEY` | If set, enables optional LLM-based line suggestions via OpenAI Chat Completions. |
 | `OPENAI_MODEL` | Model name for OpenAI (default: **`gpt-4o-mini`**). |
 
 Example:
 
 ```bash
-HEAL_MAX_EDIT_DISTANCE=20 npm run heal -- --grep TC02
+HEAL_MAX_EDIT_DISTANCE=20 npm run heal -- --grep TC02   # warn when match is weaker than distance 20
 OPENAI_API_KEY=sk-... npm run heal -- --grep TC01
 ```
 
@@ -149,7 +149,7 @@ scripts/
 
 1. Run Playwright (unless `--scan-all-pages`) and read the JSON report from the configured output file.
 2. Determine which **page object files** to scan: from failure stacks / `resolveHealTarget`, or **all** `pages/*.js` if none are found.
-3. For each file, **extract every `getByTestId('…')`**, compare to that page’s mapped static HTML, and queue **all** replacements where the id is missing and a close match exists.
+3. For each file, **extract every `getByTestId('…')`**, compare to that page’s mapped static HTML. If an id is **missing**, the agent always picks the **most suitable** existing `data-testid`: lowest case-insensitive Levenshtein distance, with token-overlap and length used as tie-breakers (no upper limit on distance unless you rely on review/`HEAL_MAX_EDIT_DISTANCE` warnings).
 4. Merge **supplemental** `getByTestId` fixes for failures on lines the scan did not change; queue **OpenAI** full-line fixes for non–`getByTestId` / noop cases when `OPENAI_API_KEY` is set.
 5. Apply **all** patches in one batch, then re-run tests (`--last-failed` on later attempts) until success or **`--max-attempts`**.
 

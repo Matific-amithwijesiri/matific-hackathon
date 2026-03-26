@@ -63,48 +63,103 @@ export function collectDataTestIds(html) {
   return [...ids];
 }
 
-export function pickClosestTestId(oldId, candidates) {
+function normalizeForMatch(s) {
+  return String(s).toLowerCase();
+}
+
+function tokenOverlap(a, b) {
+  const ta = new Set(
+    normalizeForMatch(a)
+      .split(/[-_\s.]+/)
+      .filter((t) => t.length > 0)
+  );
+  const tb = new Set(
+    normalizeForMatch(b)
+      .split(/[-_\s.]+/)
+      .filter((t) => t.length > 0)
+  );
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let n = 0;
+  for (const t of ta) {
+    if (tb.has(t)) n += 1;
+  }
+  return n;
+}
+
+function compareSuitability(a, b) {
+  if (a.lev !== b.lev) return a.lev - b.lev;
+  if (b.overlap !== a.overlap) return b.overlap - a.overlap;
+  return a.lenPen - b.lenPen;
+}
+
+/**
+ * Pick the single best data-testid string for a stale page-object id:
+ * lowest case-insensitive Levenshtein distance, then token-overlap tie-break, then length closeness.
+ */
+export function pickMostSuitableTestId(oldId, candidates) {
   if (!candidates.length) return null;
-  let best = candidates[0];
-  let bestScore = Infinity;
-  for (const c of candidates) {
-    const d = levenshtein(oldId, c);
-    if (d < bestScore) {
-      bestScore = d;
-      best = c;
+  const uniq = [...new Set(candidates)];
+  const normOld = normalizeForMatch(oldId);
+  let best = null;
+  for (const c of uniq) {
+    if (c === oldId) continue;
+    const lev = levenshtein(normOld, normalizeForMatch(c));
+    const overlap = tokenOverlap(oldId, c);
+    const lenPen = Math.abs(oldId.length - c.length);
+    const scored = { testId: c, distance: lev, overlap, lenPen };
+    if (!best || compareSuitability(scored, best) < 0) {
+      best = scored;
     }
   }
-  if (best === oldId) return null;
-  return { testId: best, distance: bestScore };
+  if (!best) return null;
+  return { testId: best.testId, distance: best.distance };
+}
+
+/** @deprecated Use pickMostSuitableTestId — kept for compatibility */
+export function pickClosestTestId(oldId, candidates) {
+  return pickMostSuitableTestId(oldId, candidates);
 }
 
 export function pageObjectBaseName(absPath) {
   return path.basename(absPath, '.js');
 }
 
-export function getMaxEditDistance() {
-  return Math.max(1, parseInt(process.env.HEAL_MAX_EDIT_DISTANCE || '15', 10) || 15);
+/**
+ * If HEAL_MAX_EDIT_DISTANCE is set, log a warning when the chosen match exceeds this Levenshtein distance
+ * (replacement is still applied — there is no hard cap).
+ */
+export function getWarnEditDistanceThreshold() {
+  const raw = process.env.HEAL_MAX_EDIT_DISTANCE;
+  if (raw === undefined || raw === '') return null;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
 }
 
 /**
- * Compare one test id to the set of data-testid values from static HTML (same rules as heal).
+ * Compare one test id to the set of data-testid values from static HTML.
+ * When the id is missing from the DOM, always maps to the most suitable candidate (no distance cap).
  */
-export function evaluateTestIdAgainstDom(oldTestId, ids, baseName, maxDist = getMaxEditDistance()) {
+export function evaluateTestIdAgainstDom(oldTestId, ids, baseName) {
   if (ids.includes(oldTestId)) {
     return {
       kind: 'noop',
       reason: `data-testid "${oldTestId}" exists in ${baseName} DOM snapshot — failure may be timing, navigation, or visibility.`,
     };
   }
-  const pick = pickClosestTestId(oldTestId, ids);
-  if (!pick) {
+  if (!ids.length) {
     return { kind: 'fail', reason: 'No data-testid attributes found in mapped HTML.' };
   }
-  if (pick.distance > maxDist) {
-    return {
-      kind: 'fail',
-      reason: `Closest data-testid "${pick.testId}" is edit distance ${pick.distance} (max ${maxDist}). Set HEAL_MAX_EDIT_DISTANCE to allow.`,
-    };
+  const pick = pickMostSuitableTestId(oldTestId, ids);
+  if (!pick) {
+    return { kind: 'fail', reason: 'Could not choose a data-testid from DOM candidates.' };
+  }
+  const warnAbove = getWarnEditDistanceThreshold();
+  if (warnAbove !== null && pick.distance > warnAbove) {
+    console.warn(
+      `[heal] ${baseName}: "${oldTestId}" → "${pick.testId}" (string distance ${pick.distance}; ` +
+        `HEAL_MAX_EDIT_DISTANCE=${warnAbove} exceeded — still applying best DOM match).`
+    );
   }
   return {
     kind: 'replace',
@@ -168,14 +223,13 @@ export async function scanPageObjectFileForDrift(projectRoot, absPath) {
       skipReason: `No HTML map for "${base}" in scripts/heal/constants.mjs — skipping ${path.basename(absPath)}`,
     };
   }
-  const maxDist = getMaxEditDistance();
   const content = await readFile(absPath, 'utf8');
   const assignments = extractGetByTestIdAssignments(content);
   const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
   const ids = collectDataTestIds(combinedHtml);
   const patches = [];
   for (const a of assignments) {
-    const ev = evaluateTestIdAgainstDom(a.oldTestId, ids, base, maxDist);
+    const ev = evaluateTestIdAgainstDom(a.oldTestId, ids, base);
     if (ev.kind === 'replace') {
       patches.push({
         pagePath: absPath,
@@ -236,7 +290,7 @@ export async function suggestTestIdHeal(projectRoot, { oldTestId, pageObjectPath
   const base = pageObjectBaseName(pageObjectPath);
   const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
   const ids = collectDataTestIds(combinedHtml);
-  return evaluateTestIdAgainstDom(oldTestId, ids, base, getMaxEditDistance());
+  return evaluateTestIdAgainstDom(oldTestId, ids, base);
 }
 
 export function replaceGetByTestIdOnLine(line, oldId, newId) {
