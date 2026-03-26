@@ -2,7 +2,11 @@
 
 ## Overview
 
-The auto-heal agent runs your Playwright tests, inspects failures, and tries to **fix broken `getByTestId(...)` locators** in page objects by comparing the failing test id to **`data-testid` values in static HTML** under `app/`. After a successful patch, it **saves the file** and **re-runs** the same test selection until the run passes or the retry limit is reached.
+The auto-heal agent runs your Playwright tests, inspects failures, and fixes **`getByTestId(...)` drift** by comparing locators to **`data-testid` values in static HTML** under `app/`.
+
+On each failed run it does **not** only fix the single failing assertion: it picks the relevant `pages/*.js` files (from stacks, or **all** page objects if it cannot infer any), then **scans every `getByTestId` in those files** against the mapped HTML and applies **all** needed replacements in one batch. After that it may add **supplemental** fixes for failures on lines the scan did not touch, then **re-runs** tests until they pass or `--max-attempts` is exceeded.
+
+You can also run **`--scan-all-pages`** with **no Playwright run** to sync every page object file to static HTML in one shot.
 
 Optional **OpenAI** integration can suggest a full replacement line when the heuristic cannot safely change a test id (for example, the id still exists in HTML but the test failed for another reason, or the locator is not a simple `getByTestId`).
 
@@ -42,6 +46,9 @@ npm run heal -- --all
 
 # Preview what would be patched (no file writes)
 npm run heal -- --grep TC01 --dry-run
+
+# No tests: scan every page object and fix all drifted getByTestId values
+npm run heal -- --scan-all-pages
 ```
 
 Always pass **`--`** before flags so npm forwards them to the script.
@@ -52,6 +59,7 @@ Always pass **`--`** before flags so npm forwards them to the script.
 node scripts/heal-agent.mjs --grep TC01
 node scripts/heal-agent.mjs --all
 node scripts/heal-agent.mjs --grep TC01 --dry-run
+node scripts/heal-agent.mjs --scan-all-pages
 ```
 
 ### Help
@@ -68,11 +76,12 @@ node scripts/heal-agent.mjs --help
 |--------|-------------|
 | `--grep <pattern>` | Same as Playwright: run only tests whose title matches the regex. |
 | `--all` | Run the full test suite (same as `playwright test` with no grep). |
-| `--max-attempts N` | Maximum heal → re-run cycles (default: **3**). |
-| `--dry-run` | Analyze failures and print the proposed change; **does not write** page object files. |
+| `--scan-all-pages` | No tests: scan every `pages/*.js` and fix all drifted `getByTestId` values. |
+| `--max-attempts N` | Maximum heal → re-run cycles (default: **3**; not used with `--scan-all-pages`). |
+| `--dry-run` | Print planned patches; **does not write** page object files. |
 | `--help` / `-h` | Show usage. |
 
-Use **either** `--grep` **or** `--all`, not both.
+Use **exactly one** of `--grep`, `--all`, or `--scan-all-pages`.
 
 ---
 
@@ -122,7 +131,7 @@ Heal runs **`playwright test`** with the project’s `playwright.config.js` (tim
 
 ```
 scripts/
-├── heal-agent.mjs          # CLI entry: run tests, resolve failure, patch, re-run loop
+├── heal-agent.mjs          # CLI: tests + full-file DOM scan, batch patch, re-run (or --scan-all-pages)
 └── heal/
     ├── constants.mjs       # PAGE_OBJECT_TO_HTML, PAGES_DIR
     ├── runner.mjs          # Spawns Playwright, parses JSON report from stdout
@@ -131,26 +140,26 @@ scripts/
     └── ai.mjs              # Optional OpenAI chat completion for full-line replacements
 ```
 
-- **`heal-agent.mjs`** wires everything together and handles `--dry-run`, `--max-attempts`, and browser-missing errors.
-- **`heal/heal.mjs`** contains the core heuristic: read failing `getByTestId`, scan mapped HTML for `data-testid`, pick the closest new id (within `HEAL_MAX_EDIT_DISTANCE`), replace **one line** in the page object file.
+- **`heal-agent.mjs`** wires everything together and handles `--dry-run`, `--max-attempts`, `--scan-all-pages`, and browser-missing errors.
+- **`heal/heal.mjs`** parses **`getByTestId`** usages, scans mapped HTML for `data-testid`, picks the closest new id (within `HEAL_MAX_EDIT_DISTANCE`), and applies batched line edits.
 
 ---
 
 ## Behavior summary
 
-1. Run Playwright with **`--reporter=json`** and capture the JSON report from stdout.
-2. Take the **first failure**; read **`Locator:`** from the error and **`pages/*.js` stack frames** to find file and line.
-3. For **`getByTestId('…')`**: load combined HTML for that page object; if the old id is missing, suggest the **closest** existing `data-testid` and patch that line.
-4. If the old id **still appears** in static HTML, the heuristic may **skip** (failure might be timing or navigation); **OpenAI** can be tried if `OPENAI_API_KEY` is set.
-5. Re-run the same **`--grep`** or **`--all`** until success or **`--max-attempts`**.
+1. Run Playwright (unless `--scan-all-pages`) and read the JSON report from the configured output file.
+2. Determine which **page object files** to scan: from failure stacks / `resolveHealTarget`, or **all** `pages/*.js` if none are found.
+3. For each file, **extract every `getByTestId('…')`**, compare to that page’s mapped static HTML, and queue **all** replacements where the id is missing and a close match exists.
+4. Merge **supplemental** `getByTestId` fixes for failures on lines the scan did not change; queue **OpenAI** full-line fixes for non–`getByTestId` / noop cases when `OPENAI_API_KEY` is set.
+5. Apply **all** patches in one batch, then re-run tests (`--last-failed` on later attempts) until success or **`--max-attempts`**.
 
 ---
 
 ## Limitations
 
-- Optimized for **`page.getByTestId(...)`** in **`pages/*.js`**. Other locator styles may need manual fixes or the OpenAI path.
+- Optimized for **`page.getByTestId(...)`** anywhere in **`pages/*.js`**. Other locator styles may need manual fixes or the OpenAI path.
 - Uses **static files in `app/`**, not a live DOM after heavy client-side mutation; dynamic-only changes are not inferred from HTML alone.
-- Patches **one failure at a time** per attempt; complex multi-locator breaks may need several runs or manual edits.
+- Page objects **without** an entry in `PAGE_OBJECT_TO_HTML` are skipped in the full-file scan; failures there still get per-failure `suggestTestIdHeal` if possible.
 
 ---
 

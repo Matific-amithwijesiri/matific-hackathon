@@ -82,6 +82,114 @@ export function pageObjectBaseName(absPath) {
   return path.basename(absPath, '.js');
 }
 
+export function getMaxEditDistance() {
+  return Math.max(1, parseInt(process.env.HEAL_MAX_EDIT_DISTANCE || '15', 10) || 15);
+}
+
+/**
+ * Compare one test id to the set of data-testid values from static HTML (same rules as heal).
+ */
+export function evaluateTestIdAgainstDom(oldTestId, ids, baseName, maxDist = getMaxEditDistance()) {
+  if (ids.includes(oldTestId)) {
+    return {
+      kind: 'noop',
+      reason: `data-testid "${oldTestId}" exists in ${baseName} DOM snapshot — failure may be timing, navigation, or visibility.`,
+    };
+  }
+  const pick = pickClosestTestId(oldTestId, ids);
+  if (!pick) {
+    return { kind: 'fail', reason: 'No data-testid attributes found in mapped HTML.' };
+  }
+  if (pick.distance > maxDist) {
+    return {
+      kind: 'fail',
+      reason: `Closest data-testid "${pick.testId}" is edit distance ${pick.distance} (max ${maxDist}). Set HEAL_MAX_EDIT_DISTANCE to allow.`,
+    };
+  }
+  return {
+    kind: 'replace',
+    oldTestId,
+    newTestId: pick.testId,
+    distance: pick.distance,
+  };
+}
+
+/**
+ * Every getByTestId('…') or getByTestId("…") in source, with 1-based line number.
+ */
+export function extractGetByTestIdAssignments(content) {
+  const lines = content.split(/\r?\n/);
+  const entries = [];
+  const re = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let m;
+    const r = new RegExp(re.source, 'g');
+    while ((m = r.exec(line)) !== null) {
+      entries.push({ line: i + 1, oldTestId: m[1] });
+    }
+  }
+  return entries;
+}
+
+export async function listAllPageObjectPaths(projectRoot) {
+  const dir = path.join(projectRoot, PAGES_DIR);
+  const names = await readdir(dir);
+  return names.filter((n) => n.endsWith('.js')).map((n) => path.join(dir, n)).sort();
+}
+
+/**
+ * Page objects implicated by failure stacks + resolveHealTarget; if none, all pages/*.js.
+ */
+export async function resolvePageFilesToScan(projectRoot, failures) {
+  const set = new Set();
+  for (const f of failures) {
+    const frame = extractPageObjectFrame(f.stack, projectRoot);
+    if (frame?.absPath) set.add(path.resolve(frame.absPath));
+    const target = await resolveHealTarget(projectRoot, f);
+    if (target?.pagePath) set.add(path.resolve(target.pagePath));
+  }
+  if (set.size === 0) {
+    for (const p of await listAllPageObjectPaths(projectRoot)) {
+      set.add(path.resolve(p));
+    }
+  }
+  return [...set].sort();
+}
+
+/**
+ * Scan one page object file: every getByTestId vs mapped static HTML; emit replace patches for drift.
+ */
+export async function scanPageObjectFileForDrift(projectRoot, absPath) {
+  const base = pageObjectBaseName(absPath);
+  if (!PAGE_OBJECT_TO_HTML[base]) {
+    return {
+      patches: [],
+      skipReason: `No HTML map for "${base}" in scripts/heal/constants.mjs — skipping ${path.basename(absPath)}`,
+    };
+  }
+  const maxDist = getMaxEditDistance();
+  const content = await readFile(absPath, 'utf8');
+  const assignments = extractGetByTestIdAssignments(content);
+  const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
+  const ids = collectDataTestIds(combinedHtml);
+  const patches = [];
+  for (const a of assignments) {
+    const ev = evaluateTestIdAgainstDom(a.oldTestId, ids, base, maxDist);
+    if (ev.kind === 'replace') {
+      patches.push({
+        pagePath: absPath,
+        line: a.line,
+        oldTestId: ev.oldTestId,
+        newTestId: ev.newTestId,
+        distance: ev.distance,
+        testTitle: '(DOM scan)',
+      });
+    }
+  }
+  return { patches };
+}
+
 export async function loadDomForPageObject(projectRoot, pageFileBase) {
   const htmlNames = PAGE_OBJECT_TO_HTML[pageFileBase];
   if (!htmlNames) return { combinedHtml: '', htmlFiles: [] };
@@ -125,35 +233,10 @@ export async function findPageLineByTestId(projectRoot, testId) {
  * Decide new locator string for a failing getByTestId using static DOM.
  */
 export async function suggestTestIdHeal(projectRoot, { oldTestId, pageObjectPath }) {
-  const maxDist = Math.max(
-    1,
-    parseInt(process.env.HEAL_MAX_EDIT_DISTANCE || '15', 10) || 15
-  );
   const base = pageObjectBaseName(pageObjectPath);
   const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
   const ids = collectDataTestIds(combinedHtml);
-  if (ids.includes(oldTestId)) {
-    return {
-      kind: 'noop',
-      reason: `data-testid "${oldTestId}" exists in ${base} DOM snapshot — failure may be timing, navigation, or visibility.`,
-    };
-  }
-  const pick = pickClosestTestId(oldTestId, ids);
-  if (!pick) {
-    return { kind: 'fail', reason: 'No data-testid attributes found in mapped HTML.' };
-  }
-  if (pick.distance > maxDist) {
-    return {
-      kind: 'fail',
-      reason: `Closest data-testid "${pick.testId}" is edit distance ${pick.distance} (max ${maxDist}). Set HEAL_MAX_EDIT_DISTANCE to allow.`,
-    };
-  }
-  return {
-    kind: 'replace',
-    oldTestId,
-    newTestId: pick.testId,
-    distance: pick.distance,
-  };
+  return evaluateTestIdAgainstDom(oldTestId, ids, base, getMaxEditDistance());
 }
 
 export function replaceGetByTestIdOnLine(line, oldId, newId) {
@@ -179,6 +262,92 @@ export async function applyTestIdPatch(absPath, lineNumber, oldId, newId) {
   const next = lines.join('\n');
   await writeFile(absPath, next, 'utf8');
   return { ok: true, newContent: next };
+}
+
+/**
+ * Deduplicate batch patches; same file/line/oldId must agree on newTestId.
+ */
+export function dedupeTestIdPatches(patches) {
+  const map = new Map();
+  for (const p of patches) {
+    const abs = path.resolve(p.pagePath);
+    const key = `${abs}:${p.line}:${p.oldTestId}`;
+    const prev = map.get(key);
+    if (prev) {
+      if (prev.newTestId !== p.newTestId) {
+        console.warn(
+          `[heal] Conflicting getByTestId replacement for ${path.basename(abs)} line ${p.line} (${p.oldTestId}): ` +
+            `"${prev.newTestId}" vs "${p.newTestId}" — keeping first.`
+        );
+      }
+      continue;
+    }
+    map.set(key, { ...p, pagePath: abs });
+  }
+  return [...map.values()];
+}
+
+/**
+ * Apply many getByTestId line edits with one read/write per file.
+ */
+export async function applyTestIdPatchesBatch(patches) {
+  const deduped = dedupeTestIdPatches(patches);
+  const byFile = new Map();
+  for (const p of deduped) {
+    const abs = path.resolve(p.pagePath);
+    if (!byFile.has(abs)) byFile.set(abs, []);
+    byFile.get(abs).push(p);
+  }
+  for (const [abs, items] of byFile) {
+    const raw = await readFile(abs, 'utf8');
+    const lines = raw.split(/\r?\n/);
+    for (const p of items) {
+      const idx = p.line - 1;
+      if (idx < 0 || idx >= lines.length) {
+        return { ok: false, reason: `Line ${p.line} out of range in ${path.basename(abs)}` };
+      }
+      const replaced = replaceGetByTestIdOnLine(lines[idx], p.oldTestId, p.newTestId);
+      if (!replaced) {
+        return {
+          ok: false,
+          reason: `Could not replace getByTestId('${p.oldTestId}') on line ${p.line} in ${path.basename(abs)}`,
+        };
+      }
+      lines[idx] = replaced;
+    }
+    await writeFile(abs, lines.join('\n'), 'utf8');
+  }
+  return { ok: true, applied: deduped.length };
+}
+
+/**
+ * Replace whole lines (e.g. OpenAI suggestions). Last edit wins for duplicate line keys.
+ */
+export async function applyLinePatchesBatch(edits) {
+  /** @type {Map<string, Map<number, string>>} */
+  const byFile = new Map();
+  for (const e of edits) {
+    const abs = path.resolve(e.pagePath);
+    if (!byFile.has(abs)) byFile.set(abs, new Map());
+    const lineMap = byFile.get(abs);
+    if (lineMap.has(e.line) && lineMap.get(e.line) !== e.newLine) {
+      console.warn(`[heal] OpenAI/full-line conflict at ${path.basename(abs)}:${e.line} — last replacement wins.`);
+    }
+    lineMap.set(e.line, e.newLine);
+  }
+  for (const [abs, lineMap] of byFile) {
+    const raw = await readFile(abs, 'utf8');
+    const lines = raw.split(/\r?\n/);
+    for (const [lineNum, newLine] of lineMap) {
+      const idx = lineNum - 1;
+      if (idx < 0 || idx >= lines.length) {
+        return { ok: false, reason: `Line ${lineNum} out of range in ${path.basename(abs)}` };
+      }
+      lines[idx] = newLine;
+    }
+    await writeFile(abs, lines.join('\n'), 'utf8');
+  }
+  return { ok: true, applied: edits.length };
 }
 
 /**
