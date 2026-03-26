@@ -15,7 +15,7 @@ class LoginPage {
     this.welcomeHeading = page.getByTestId('login-welcome-heading');
     this.emailInput = page.getByTestId('login-email');
     this.passwordInput = page.getByTestId('login-password');
-    this.loginButton = page.getByTestId('login-submit');
+    this.submitButton = page.getByTestId('login-submit');
     this.loginError = page.getByTestId('login-error');
     this.demoCredentialsHint = page.getByTestId('login-demo-hint');
   }
@@ -27,7 +27,7 @@ class LoginPage {
   async login(email, password) {
     await this.emailInput.fill(email);
     await this.passwordInput.fill(password);
-    await this.loginButton.click();
+    await this.submitButton.click();
   }
 }
 

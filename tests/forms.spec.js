@@ -227,7 +227,7 @@ test.describe('Bootstrap Forms Automation using POM', () => {
       await expect(page).toHaveURL(/index\.html/);
       await expect(page).toHaveTitle(/Login/i);
       await expect(loginPage.welcomeHeading).toBeVisible();
-      await expect(loginPage.loginButton).toBeVisible();
+      await expect(loginPage.submitButton).toBeVisible();
       await expect(loginPage.loginError).toBeHidden();
       await expect(loginPage.demoCredentialsHint).toBeVisible();
     });
