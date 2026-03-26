@@ -34,6 +34,7 @@ import {
   resolvePageFilesToScan,
   scanPageObjectFileForDrift,
   listAllPageObjectPaths,
+  getPropertyNameAtLine,
 } from './heal/heal.mjs';
 import { suggestHealWithOpenAI } from './heal/ai.mjs';
 
@@ -124,6 +125,14 @@ async function buildHealPlan(projectRoot, failures) {
 
   const linesTouchedByScan = new Set(testIdPatches.map((p) => lineKey(p.pagePath, p.line)));
 
+  /** Per page-object class: DOM data-testid values already chosen this round */
+  const reservedDomByBase = new Map();
+  for (const p of testIdPatches) {
+    const b = pageObjectBaseName(p.pagePath);
+    if (!reservedDomByBase.has(b)) reservedDomByBase.set(b, new Set());
+    reservedDomByBase.get(b).add(p.newTestId);
+  }
+
   const openAiTasks = [];
   const unmapped = [];
   const heuristicFailed = [];
@@ -144,12 +153,20 @@ async function buildHealPlan(projectRoot, failures) {
       continue;
     }
 
+    const base = pageObjectBaseName(target.pagePath);
+    if (!reservedDomByBase.has(base)) reservedDomByBase.set(base, new Set());
+    const reservedNewTestIds = reservedDomByBase.get(base);
+    const propertyName = await getPropertyNameAtLine(target.pagePath, target.line);
+
     const suggestion = await suggestTestIdHeal(projectRoot, {
       oldTestId: target.oldTestId,
       pageObjectPath: target.pagePath,
+      propertyName,
+      reservedNewTestIds,
     });
 
     if (suggestion.kind === 'replace') {
+      reservedNewTestIds.add(suggestion.newTestId);
       testIdPatches.push({
         pagePath: target.pagePath,
         line: target.line,

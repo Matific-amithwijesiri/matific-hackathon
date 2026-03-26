@@ -149,7 +149,7 @@ scripts/
 
 1. Run Playwright (unless `--scan-all-pages`) and read the JSON report from the configured output file.
 2. Determine which **page object files** to scan: from failure stacks / `resolveHealTarget`, or **all** `pages/*.js` if none are found.
-3. For each file, **extract every `getByTestId('…')`**, compare to that page’s mapped static HTML. If an id is **missing**, the agent always picks the **most suitable** existing `data-testid`: lowest case-insensitive Levenshtein distance, with token-overlap and length used as tie-breakers (no upper limit on distance unless you rely on review/`HEAL_MAX_EDIT_DISTANCE` warnings).
+3. For each file, **extract every `getByTestId('…')`**, including **`this.propertyName = page.getByTestId(...)`** so the **property name** (e.g. `emailInput`) can be matched to DOM ids like `login-email`. Stale locators on the same page are assigned **unique** DOM `data-testid` values in one pass (greedy by a combined property + string similarity score), so two broken locators do not map to the same DOM id unless there are more fixes than distinct ids (then a warning is logged). **Supplemental** heals from test failures respect the same reserved set per page class.
 4. Merge **supplemental** `getByTestId` fixes for failures on lines the scan did not change; queue **OpenAI** full-line fixes for non–`getByTestId` / noop cases when `OPENAI_API_KEY` is set.
 5. Apply **all** patches in one batch, then re-run tests (`--last-failed` on later attempts) until success or **`--max-attempts`**.
 

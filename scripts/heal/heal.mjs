@@ -86,26 +86,166 @@ function tokenOverlap(a, b) {
   return n;
 }
 
+/** camelCase / snake_case property names → tokens (e.g. emailInput → email, input). */
+export function propertyNameToTokens(propertyName) {
+  if (!propertyName) return [];
+  return String(propertyName)
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+}
+
+/**
+ * Token overlap between property name and a DOM test id (exact + loose substring for tokens ≥ 3 chars).
+ */
+function propertyDomTokenAffinity(propertyName, domId) {
+  const ptoks = propertyNameToTokens(propertyName);
+  if (!ptoks.length) return 0;
+  const domParts = normalizeForMatch(domId).split(/[-_\s.]+/).filter((t) => t.length > 0);
+  const domSet = new Set(domParts);
+  let score = 0;
+  for (const t of ptoks) {
+    if (domSet.has(t)) score += 4;
+    if (t.length < 3) continue;
+    for (const d of domParts) {
+      if (d.includes(t) || t.includes(d)) score += 1;
+    }
+  }
+  return score;
+}
+
 function compareSuitability(a, b) {
   if (a.lev !== b.lev) return a.lev - b.lev;
   if (b.overlap !== a.overlap) return b.overlap - a.overlap;
   return a.lenPen - b.lenPen;
 }
 
+/** Higher = better match for greedy unique assignment (entry × dom id). */
+function matchScoreEntryDom(entry, domId) {
+  const lev = levenshtein(normalizeForMatch(entry.oldTestId), normalizeForMatch(domId));
+  const oldOv = tokenOverlap(entry.oldTestId, domId);
+  const propAff = entry.propertyName ? propertyDomTokenAffinity(entry.propertyName, domId) : 0;
+  return propAff * 80 + oldOv * 25 - lev;
+}
+
 /**
- * Pick the single best data-testid string for a stale page-object id:
- * lowest case-insensitive Levenshtein distance, then token-overlap tie-break, then length closeness.
+ * Build non-conflicting oldId → new DOM id assignments for one page object / HTML surface.
+ * Each DOM data-testid is used at most once; ties broken by matchScoreEntryDom.
  */
-export function pickMostSuitableTestId(oldId, candidates) {
-  if (!candidates.length) return null;
-  const uniq = [...new Set(candidates)];
-  const normOld = normalizeForMatch(oldId);
+export function assignUniqueDomReplacements(staleEntries, domIds, baseName) {
+  const pool = [...new Set(domIds)];
+  const stale = staleEntries.filter((e) => !pool.includes(e.oldTestId));
+  if (!stale.length) return [];
+
+  const pairs = [];
+  for (const e of stale) {
+    const entryKey = `${e.line}\0${e.oldTestId}`;
+    for (const d of pool) {
+      const lev = levenshtein(normalizeForMatch(e.oldTestId), normalizeForMatch(d));
+      pairs.push({ entryKey, e, domId: d, score: matchScoreEntryDom(e, d), lev });
+    }
+  }
+  pairs.sort((a, b) => b.score - a.score);
+
+  const usedDom = new Set();
+  const doneEntry = new Set();
+  /** @type {{ line: number, oldTestId: string, propertyName: string|null, newTestId: string, distance: number }[]} */
+  const out = [];
+
+  for (const p of pairs) {
+    if (doneEntry.has(p.entryKey)) continue;
+    if (usedDom.has(p.domId)) continue;
+    doneEntry.add(p.entryKey);
+    usedDom.add(p.domId);
+    out.push({
+      line: p.e.line,
+      oldTestId: p.e.oldTestId,
+      propertyName: p.e.propertyName ?? null,
+      newTestId: p.domId,
+      distance: p.lev,
+    });
+  }
+
+  for (const e of stale) {
+    const entryKey = `${e.line}\0${e.oldTestId}`;
+    if (doneEntry.has(entryKey)) continue;
+    const remaining = pool.filter((d) => !usedDom.has(d));
+    if (remaining.length > 0) {
+      let best = null;
+      for (const d of remaining) {
+        const lev = levenshtein(normalizeForMatch(e.oldTestId), normalizeForMatch(d));
+        const score = matchScoreEntryDom(e, d);
+        const row = { domId: d, lev, score };
+        if (!best || row.score > best.score || (row.score === best.score && row.lev < best.lev)) {
+          best = row;
+        }
+      }
+      if (best) {
+        doneEntry.add(entryKey);
+        usedDom.add(best.domId);
+        out.push({
+          line: e.line,
+          oldTestId: e.oldTestId,
+          propertyName: e.propertyName ?? null,
+          newTestId: best.domId,
+          distance: best.lev,
+        });
+      }
+      continue;
+    }
+
+    console.warn(
+      `[heal] ${baseName}: no unused data-testid left for line ${e.line} (${e.propertyName || e.oldTestId}) — ` +
+        `reusing a DOM id (more stale locators than distinct test ids).`
+    );
+    let best = null;
+    for (const d of pool) {
+      const lev = levenshtein(normalizeForMatch(e.oldTestId), normalizeForMatch(d));
+      const scored = {
+        testId: d,
+        lev,
+        overlap: tokenOverlap(e.oldTestId, d) + propertyDomTokenAffinity(e.propertyName, d),
+        lenPen: Math.abs(e.oldTestId.length - d.length),
+      };
+      if (!best || compareSuitability(scored, best) < 0) best = scored;
+    }
+    if (best) {
+      doneEntry.add(entryKey);
+      out.push({
+        line: e.line,
+        oldTestId: e.oldTestId,
+        propertyName: e.propertyName ?? null,
+        newTestId: best.testId,
+        distance: best.lev,
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Pick the best data-testid for one entry; optional reserved set avoids reusing DOM ids already assigned.
+ */
+export function pickMostSuitableTestIdForEntry(entry, candidates, reservedNewTestIds) {
+  let uniq = [...new Set(candidates)].filter((c) => c !== entry.oldTestId);
+  if (reservedNewTestIds?.size) {
+    const free = uniq.filter((c) => !reservedNewTestIds.has(c));
+    if (free.length) uniq = free;
+    else
+      console.warn(
+        `[heal] All DOM test ids are reserved for this page; picking best match even if already claimed.`
+      );
+  }
+  if (!uniq.length) return null;
+
   let best = null;
   for (const c of uniq) {
-    if (c === oldId) continue;
-    const lev = levenshtein(normOld, normalizeForMatch(c));
-    const overlap = tokenOverlap(oldId, c);
-    const lenPen = Math.abs(oldId.length - c.length);
+    const lev = levenshtein(normalizeForMatch(entry.oldTestId), normalizeForMatch(c));
+    const overlap = tokenOverlap(entry.oldTestId, c) + propertyDomTokenAffinity(entry.propertyName, c);
+    const lenPen = Math.abs(entry.oldTestId.length - c.length);
     const scored = { testId: c, distance: lev, overlap, lenPen };
     if (!best || compareSuitability(scored, best) < 0) {
       best = scored;
@@ -113,6 +253,13 @@ export function pickMostSuitableTestId(oldId, candidates) {
   }
   if (!best) return null;
   return { testId: best.testId, distance: best.distance };
+}
+
+/**
+ * Pick the single best data-testid string for a stale page-object id (no property / uniqueness context).
+ */
+export function pickMostSuitableTestId(oldId, candidates) {
+  return pickMostSuitableTestIdForEntry({ oldTestId: oldId, propertyName: null }, candidates, undefined);
 }
 
 /** @deprecated Use pickMostSuitableTestId — kept for compatibility */
@@ -139,8 +286,10 @@ export function getWarnEditDistanceThreshold() {
 /**
  * Compare one test id to the set of data-testid values from static HTML.
  * When the id is missing from the DOM, always maps to the most suitable candidate (no distance cap).
+ * `propertyName` / `reservedNewTestIds` refine scoring and avoid reusing DOM ids already taken.
  */
-export function evaluateTestIdAgainstDom(oldTestId, ids, baseName) {
+export function evaluateTestIdAgainstDom(oldTestId, ids, baseName, options = {}) {
+  const { propertyName = null, reservedNewTestIds } = options;
   if (ids.includes(oldTestId)) {
     return {
       kind: 'noop',
@@ -150,7 +299,11 @@ export function evaluateTestIdAgainstDom(oldTestId, ids, baseName) {
   if (!ids.length) {
     return { kind: 'fail', reason: 'No data-testid attributes found in mapped HTML.' };
   }
-  const pick = pickMostSuitableTestId(oldTestId, ids);
+  const pick = pickMostSuitableTestIdForEntry(
+    { oldTestId, propertyName },
+    ids,
+    reservedNewTestIds
+  );
   if (!pick) {
     return { kind: 'fail', reason: 'Could not choose a data-testid from DOM candidates.' };
   }
@@ -170,18 +323,25 @@ export function evaluateTestIdAgainstDom(oldTestId, ids, baseName) {
 }
 
 /**
- * Every getByTestId('…') or getByTestId("…") in source, with 1-based line number.
+ * Every getByTestId in source with 1-based line; `this.propertyName = page.getByTestId(...)` sets propertyName.
  */
 export function extractGetByTestIdAssignments(content) {
   const lines = content.split(/\r?\n/);
   const entries = [];
-  const re = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const assignRe = /this\.(\w+)\s*=\s*page\.getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
+  const bareRe = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     let m;
-    const r = new RegExp(re.source, 'g');
-    while ((m = r.exec(line)) !== null) {
-      entries.push({ line: i + 1, oldTestId: m[1] });
+    const r1 = new RegExp(assignRe.source, 'g');
+    while ((m = r1.exec(line)) !== null) {
+      entries.push({ line: i + 1, oldTestId: m[2], propertyName: m[1] });
+    }
+    const r2 = new RegExp(bareRe.source, 'g');
+    while ((m = r2.exec(line)) !== null) {
+      const tid = m[1];
+      if (entries.some((e) => e.line === i + 1 && e.oldTestId === tid)) continue;
+      entries.push({ line: i + 1, oldTestId: tid, propertyName: null });
     }
   }
   return entries;
@@ -228,18 +388,23 @@ export async function scanPageObjectFileForDrift(projectRoot, absPath) {
   const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
   const ids = collectDataTestIds(combinedHtml);
   const patches = [];
-  for (const a of assignments) {
-    const ev = evaluateTestIdAgainstDom(a.oldTestId, ids, base);
-    if (ev.kind === 'replace') {
-      patches.push({
-        pagePath: absPath,
-        line: a.line,
-        oldTestId: ev.oldTestId,
-        newTestId: ev.newTestId,
-        distance: ev.distance,
-        testTitle: '(DOM scan)',
-      });
+  const planned = assignUniqueDomReplacements(assignments, ids, base);
+  for (const u of planned) {
+    const warnAbove = getWarnEditDistanceThreshold();
+    if (warnAbove !== null && u.distance > warnAbove) {
+      console.warn(
+        `[heal] ${base}: "${u.oldTestId}" → "${u.newTestId}" (string distance ${u.distance}; ` +
+          `HEAL_MAX_EDIT_DISTANCE=${warnAbove} exceeded — still applying).`
+      );
     }
+    patches.push({
+      pagePath: absPath,
+      line: u.line,
+      oldTestId: u.oldTestId,
+      newTestId: u.newTestId,
+      distance: u.distance,
+      testTitle: '(DOM scan)',
+    });
   }
   return { patches };
 }
@@ -284,13 +449,23 @@ export async function findPageLineByTestId(projectRoot, testId) {
 }
 
 /**
+ * `this.foo` on the line if the assignment uses page.getByTestId.
+ */
+export async function getPropertyNameAtLine(absPath, lineNumber) {
+  const raw = await readFile(absPath, 'utf8');
+  const line = raw.split(/\r?\n/)[lineNumber - 1] ?? '';
+  const m = line.match(/this\.(\w+)\s*=\s*page\.getByTestId\s*\(/);
+  return m ? m[1] : null;
+}
+
+/**
  * Decide new locator string for a failing getByTestId using static DOM.
  */
-export async function suggestTestIdHeal(projectRoot, { oldTestId, pageObjectPath }) {
+export async function suggestTestIdHeal(projectRoot, { oldTestId, pageObjectPath, propertyName, reservedNewTestIds }) {
   const base = pageObjectBaseName(pageObjectPath);
   const { combinedHtml } = await loadDomForPageObject(projectRoot, base);
   const ids = collectDataTestIds(combinedHtml);
-  return evaluateTestIdAgainstDom(oldTestId, ids, base);
+  return evaluateTestIdAgainstDom(oldTestId, ids, base, { propertyName, reservedNewTestIds });
 }
 
 export function replaceGetByTestIdOnLine(line, oldId, newId) {
